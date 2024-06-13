@@ -22,6 +22,11 @@
 #define SECONDS_IN_HOUR                                 (60 * SECONDS_IN_MINUTE)
 #define SECONDS_IN_DAY                                  (24 * SECONDS_IN_HOUR)
 
+#define MINUTES_IN_HOUR                                 60
+#define MINUTES_IN_DAY                                  1440
+#define YEAR_OFFSET                                     1900
+#define MONTH_OFFSET                                    1   
+
 /* Useful type constants */
 
 #define BITS_PER_BYTE                                   8
@@ -87,10 +92,13 @@
 
 #define MINIMUM_SUPPLY_VOLTAGE                          2800
 
+/* Acoustic location constant */
+
+#define ACOUSTIC_LOCATION_SIZE_IN_BYTES                 7
+
 /* Audio configuration constant */
 
 #define AUDIO_CONFIG_PULSE_INTERVAL                     8
-
 #define AUDIO_CONFIG_TIME_CORRECTION                    2
 
 /* Configuration file read constant */
@@ -118,6 +126,12 @@
 #define SLEEP_RECORD_CYCLES_DISABLED                    0
 
 #define INITIAL_AND_STANDARD_SLEEP_RECORD_CYCLES        2
+
+/* Location constants */
+
+#define ACOUSTIC_LONGITUDE_MULTIPLIER                   2
+
+#define ACOUSTIC_LOCATION_PRECISION                     1000000
 
 /* Useful macros */
 
@@ -147,6 +161,10 @@
     AudioMoth_powerDownAndWake(duration, true); \
 }
 
+#define SERIAL_NUMBER                           "%08X%08X"
+
+#define FORMAT_SERIAL_NUMBER(src)               (unsigned int)*((uint32_t*)src + 1),  (unsigned int)*((uint32_t*)src)
+
 #define ABS(a)                                  ((a) < (0) ? (-a) : (a))
 
 #define MIN(a, b)                               ((a) < (b) ? (a) : (b))
@@ -165,13 +183,24 @@ typedef enum {NO_FILTER, LOW_PASS_FILTER, BAND_PASS_FILTER, HIGH_PASS_FILTER} AM
 
 /* Configuration index enumeration */
 
+typedef enum {INITIAL_SLEEP_RECORD_CYCLE, STANDARD_SLEEP_RECORD_CYCLE} AM_sleepRecordIndex_t;
+
 typedef enum {STANDARD_RECORDING, OPPORTUNISTIC_RECORDING} AM_configurationIndex_t;
 
-typedef enum {INITIAL_SLEEP_RECORD_CYCLE, STANDARD_SLEEP_RECORD_CYCLE} AM_sleepRecordIndex_t;
+/* Acoustic location data structure */
 
 #pragma pack(push, 1)
 
+typedef struct {
+    int32_t latitude: 28;
+    int32_t longitude: 28;
+} acousticLocation_t;
+
+#pragma pack(pop)
+
 /* WAV header */
+
+#pragma pack(push, 1)
 
 typedef struct {
     char id[RIFF_ID_LENGTH];
@@ -225,12 +254,12 @@ static wavHeader_t wavHeader = {
 
 /* Functions to set WAV header details and comment */
 
-static void setHeaderDetails(wavHeader_t *wavHeader, uint32_t sampleRate, uint32_t numberOfSamples) {
+static void setHeaderDetails(wavHeader_t *wavHeader, uint32_t sampleRate, uint32_t numberOfSamples, uint32_t guanoHeaderSize) {
 
     wavHeader->wavFormat.samplesPerSecond = sampleRate;
     wavHeader->wavFormat.bytesPerSecond = NUMBER_OF_BYTES_IN_SAMPLE * sampleRate;
     wavHeader->data.size = NUMBER_OF_BYTES_IN_SAMPLE * numberOfSamples;
-    wavHeader->riff.size = NUMBER_OF_BYTES_IN_SAMPLE * numberOfSamples + sizeof(wavHeader_t) - sizeof(chunk_t);
+    wavHeader->riff.size = NUMBER_OF_BYTES_IN_SAMPLE * numberOfSamples + sizeof(wavHeader_t) + guanoHeaderSize - sizeof(chunk_t);
 
 }
 
@@ -382,6 +411,70 @@ static const CP_configSettings_t defaultConfigSettings = {
     .latestRecordingTime = 0
 };
 
+/* Function to write the GUANO data */
+
+static uint32_t writeGuanoData(char *buffer, CP_configSettings_t *configSettings, uint32_t currentTime, uint32_t *acousticLocationReceived, int32_t *acousticLatitude, int32_t *acousticLongitude, uint8_t *firmwareDescription, uint8_t *firmwareVersion, uint8_t *serialNumber, char *filename, AM_extendedBatteryState_t extendedBatteryState, int32_t temperature) {
+
+    uint32_t length = sprintf(buffer, "guan");
+    
+    length += UINT32_SIZE_IN_BYTES;
+    
+    length += sprintf(buffer + length, "GUANO|Version:1.0\nMake:Open Acoustic Devices\nModel:AudioMoth\nSerial:" SERIAL_NUMBER "\n", FORMAT_SERIAL_NUMBER(serialNumber));
+
+    length += sprintf(buffer + length, "Firmware Version:%s (%u.%u.%u)\n", firmwareDescription, firmwareVersion[0], firmwareVersion[1], firmwareVersion[2]);
+
+    int32_t timezoneOffset = configSettings->timezoneHours * SECONDS_IN_HOUR + configSettings->timezoneMinutes * SECONDS_IN_MINUTE;
+
+    time_t rawTime = currentTime + timezoneOffset;
+
+    struct tm time;
+
+    gmtime_r(&rawTime, &time);
+
+    length += sprintf(buffer + length, "Timestamp:%04d-%02d-%02dT%02d:%02d:%02d", YEAR_OFFSET + time.tm_year, MONTH_OFFSET + time.tm_mon, time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec);
+
+    if (timezoneOffset == 0) {
+
+        length += sprintf(buffer + length, "Z\n");
+        
+    } else if (timezoneOffset < 0) {
+
+        length += sprintf(buffer + length, "-%02d:%02d\n", ABS(configSettings->timezoneHours), ABS(configSettings->timezoneMinutes));
+
+    } else {
+
+        length += sprintf(buffer + length, "+%02d:%02d\n", configSettings->timezoneHours, configSettings->timezoneMinutes);
+
+    }
+
+    if (*acousticLocationReceived) {
+
+        char *latitudeSign = *acousticLatitude < 0 ? "-" : "";
+
+        char *longitudeSign = *acousticLongitude < 0 ? "-" : "";
+
+        length += sprintf(buffer + length, "Loc Position:%s%ld.%06ld %s%ld.%06ld\nOAD|Loc Source:Acoustic chime\n", latitudeSign, ABS(*acousticLatitude) / ACOUSTIC_LOCATION_PRECISION, ABS(*acousticLatitude) % ACOUSTIC_LOCATION_PRECISION, longitudeSign, ABS(*acousticLongitude) / ACOUSTIC_LOCATION_PRECISION, ABS(*acousticLongitude) % ACOUSTIC_LOCATION_PRECISION);
+
+    }
+
+    length += sprintf(buffer + length, "Original Filename:%s\n", filename);
+
+    uint32_t batteryVoltage = extendedBatteryState == AM_EXT_BAT_LOW ? 24 : extendedBatteryState >= AM_EXT_BAT_FULL ? 50 : extendedBatteryState + AM_EXT_BAT_STATE_OFFSET / AM_BATTERY_STATE_INCREMENT;
+
+    length += sprintf(buffer + length, "OAD|Battery Voltage:%01lu.%01lu\n", batteryVoltage / 10, batteryVoltage % 10);
+    
+    char *temperatureSign = temperature < 0 ? "-" : "";
+
+    uint32_t temperatureInDecidegrees = ROUNDED_DIV(ABS(temperature), 100);
+
+    length += sprintf(buffer + length, "Temperature Int:%s%lu.%lu", temperatureSign, temperatureInDecidegrees / 10, temperatureInDecidegrees % 10);
+    
+    *(uint32_t*)(buffer + RIFF_ID_LENGTH) = length - sizeof(chunk_t);;
+
+    return length;
+
+}
+
 /* Function to write configuration to file */
 
 static bool writeConfigurationToFile(CP_configSettings_t *configSettings, uint8_t *firmwareDescription, uint8_t *firmwareVersion, uint8_t *serialNumber) {
@@ -424,7 +517,13 @@ static uint32_t *previousDayOfYear = (uint32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS 
 
 static uint32_t *totalFileSizeWritten = (uint32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 32);
 
-static CP_configSettings_t *configSettings = (CP_configSettings_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 36);
+static int32_t *acousticLatitude = (int32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 36);
+
+static int32_t *acousticLongitude = (int32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 40);
+
+static uint32_t *acousticLocationReceived = (uint32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 44);
+
+static CP_configSettings_t *configSettings = (CP_configSettings_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 48);
 
 /* Filter variables */
 
@@ -478,11 +577,11 @@ static int16_t secondaryBuffer[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
 
 /* Current recording file name */
 
-static char fileName[32];
+static char filename[32];
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {0, 1, 5};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {0, 1, 6};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-LIFEPLAN";
 
@@ -541,6 +640,8 @@ int main(void) {
         *totalFileSizeWritten = 0;
 
         *previousDayOfYear = UINT32_MAX;
+
+        *acousticLocationReceived = false;
 
         copyToBackupDomain((uint32_t*)configSettings, (uint8_t*)&defaultConfigSettings, sizeof(CP_configSettings_t));
 
@@ -915,7 +1016,13 @@ void AudioConfig_handleAudioConfigurationEvent(AC_audioConfigurationEvent_t even
 
 void AudioConfig_handleAudioConfigurationPacket(uint8_t *receiveBuffer, uint32_t size) {
 
-    if (!AudioMoth_hasTimeBeenSet() && size == UINT32_SIZE_IN_BYTES + UINT16_SIZE_IN_BYTES) {
+    uint32_t standardPacketSize = UINT32_SIZE_IN_BYTES + UINT16_SIZE_IN_BYTES;
+
+    bool standardPacket = size == standardPacketSize;
+
+    bool hasLocation = size == standardPacketSize + ACOUSTIC_LOCATION_SIZE_IN_BYTES;
+
+    if (AudioMoth_hasTimeBeenSet() == false && (standardPacket || hasLocation)) {
 
         uint32_t time;
 
@@ -924,6 +1031,20 @@ void AudioConfig_handleAudioConfigurationPacket(uint8_t *receiveBuffer, uint32_t
         AudioMoth_setTime(time + AUDIO_CONFIG_TIME_CORRECTION, 0);
 
         AudioMoth_setGreenLED(true);
+
+        if (hasLocation) {
+
+            acousticLocation_t location;
+
+            memcpy(&location, receiveBuffer + standardPacketSize, ACOUSTIC_LOCATION_SIZE_IN_BYTES);
+
+            *acousticLocationReceived = true;
+
+            *acousticLatitude = location.latitude;
+            
+            *acousticLongitude = location.longitude * ACOUSTIC_LONGITUDE_MULTIPLIER;
+
+        }
 
     }
 
@@ -1075,15 +1196,15 @@ static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDu
 
     /* Open a file with the current local time as the name */
 
-    uint32_t length = sprintf(fileName, "%04d%02d%02d_%02d%02d%02d", 1900 + time->tm_year, 1 + time->tm_mon, time->tm_mday, time->tm_hour, time->tm_min, time->tm_sec);
+    uint32_t length = sprintf(filename, "%04d%02d%02d_%02d%02d%02d", YEAR_OFFSET + time->tm_year, MONTH_OFFSET + time->tm_mon, time->tm_mday, time->tm_hour, time->tm_min, time->tm_sec);
 
     static char *extensions[4] = {".WAV", "T.WAV"};
 
     uint32_t extensionIndex = configSettings->amplitudeThreshold[*configurationIndexOfNextRecording] > 0 ? 1 : 0;
 
-    strcpy(fileName + length, extensions[extensionIndex]);
+    strcpy(filename + length, extensions[extensionIndex]);
 
-    FLASH_LED_AND_RETURN_ON_ERROR(AudioMoth_openFile(fileName));
+    FLASH_LED_AND_RETURN_ON_ERROR(AudioMoth_openFile(filename));
 
     AudioMoth_setRedLED(false);
 
@@ -1211,11 +1332,17 @@ static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDu
 
     }
 
+    /* Write the GUANO data */
+
+    uint32_t guanoDataSize = writeGuanoData((char*)compressionBuffer, configSettings, currentTime, acousticLocationReceived, acousticLatitude, acousticLongitude, firmwareDescription, firmwareVersion, (uint8_t*)AM_UNIQUE_ID_START_ADDRESS, filename, extendedBatteryState, temperature);
+
+    FLASH_LED_AND_RETURN_ON_ERROR(AudioMoth_writeToFile(compressionBuffer, guanoDataSize));
+
     /* Initialise the WAV header */
 
     samplesWritten = MAX(numberOfSamplesInHeader, samplesWritten);
 
-    setHeaderDetails(&wavHeader, effectiveSampleRate, samplesWritten - numberOfSamplesInHeader - totalNumberOfCompressedSamples);
+    setHeaderDetails(&wavHeader, effectiveSampleRate, samplesWritten - numberOfSamplesInHeader - totalNumberOfCompressedSamples, guanoDataSize);
 
     setHeaderComment(&wavHeader, currentTime, configSettings->timezoneHours, configSettings->timezoneMinutes, (uint8_t*)AM_UNIQUE_ID_START_ADDRESS, configSettings->gain[*configurationIndexOfNextRecording], extendedBatteryState, temperature, switchPositionChanged, supplyVoltageLow, fileSizeLimited, totalFileSizeLimited, configSettings->amplitudeThreshold[*configurationIndexOfNextRecording], requestedFilterType, configSettings->lowerFilterFreq[*configurationIndexOfNextRecording], configSettings->higherFilterFreq[*configurationIndexOfNextRecording]);
 
